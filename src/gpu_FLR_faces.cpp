@@ -13,6 +13,7 @@
 #include "opencv2/highgui/highgui.hpp"
 #include "opencv2/imgproc/imgproc.hpp"
 #include "opencv2/gpu/gpu.hpp"
+#include "opencv2/opencv.hpp"
 
 using namespace std;
 using namespace cv;
@@ -102,6 +103,7 @@ class FacesDetector_GPU
 public:
     FacesDetector_GPU(ros::NodeHandle nh, ros::NodeHandle nh_private);
     void imageCallback(const sensor_msgs::Image::ConstPtr& msg);
+    void update();
 private:
     ros::NodeHandle nh_, nh_private_;
     image_transport::ImageTransport it_;
@@ -122,8 +124,14 @@ private:
     int detections_num_left;
     int detections_num_right;
 
+    KalmanFilter kf;        // Tracking the face
+    int face_state;         // 0 = Left, 1 = front, 2 = right
+    bool has_face;          // To set that now there is a face being tracked
+    int count_face;         // Counting the times face is correctly tracked, if > 3 --> has_face = true;
+    ros::Time last_time;
+
     // For grouping faces detection from front, left, and right detectors, then estimate the direction. Output only one face.
-    int groupFaces(vector<Rect> &inputFront, vector<Rect> &inputLeft, vector<Rect> &inputRight, Rect &output, float* probs, vector<Rect> &outputList, int groupThreshold=2, double eps=0.2);
+    void groupFaces(vector<Rect> &inputFront, vector<Rect> &inputLeft, vector<Rect> &inputRight, Rect &output, float* probs, vector<Rect> &outputList, int groupThreshold=2, double eps=0.2);
 };
 
 int main(int argc, char **argv)
@@ -137,7 +145,12 @@ int main(int argc, char **argv)
     ros::init(argc, argv, "face_detect_blimp");
     ros::NodeHandle nh, nh_private("~");
     FacesDetector_GPU face_detector(nh, nh_private);
-    ros::spin();
+    ros::Rate r(30);
+    while (ros::ok()) {
+        face_detector.update();
+        ros::spinOnce();
+        r.sleep();
+    }
     
     return 0;
 }
@@ -174,6 +187,9 @@ FacesDetector_GPU::FacesDetector_GPU(ros::NodeHandle nh, ros::NodeHandle nh_priv
     filterRects = false;
     helpScreen = false;
     neighborThreshold = 6;
+
+    has_face = false;
+    count_face = 0;
 }
 
 void FacesDetector_GPU::imageCallback(const sensor_msgs::Image::ConstPtr& msg) {
@@ -267,33 +283,86 @@ void FacesDetector_GPU::imageCallback(const sensor_msgs::Image::ConstPtr& msg) {
     rightVector.assign(right_downloaded.begin<Rect>(), right_downloaded.end<Rect>());
     groupFaces(frontVector, leftVector, rightVector, the_face, probs, facesList, neighborThreshold, 0.2);
 
-    for (int i = 0; i < facesList.size(); i++) {
-        rectangle(frameDisp, facesList[i], Scalar(255,255,255), 2);
-    }
+    //for (int i = 0; i < facesList.size(); i++) {
+    //    rectangle(frameDisp, facesList[i], Scalar(255,255,255), 2);
+    //}
     gpu_opencv::FaceServo face_msg;
 
     if (facesList.size()) {
         face_msg.header.stamp = ros::Time::now();
-        rectangle(frameDisp, the_face, Scalar(0,255,255), 2);
+        //rectangle(frameDisp, the_face, Scalar(0,255,255), 2);
         char buff[20];
         Scalar face_color(0,255,0);
         float best = probs[0];
+        int new_face_state = 1;
         if (probs[1] > best) {
             face_color = Scalar(0,0,255);
             best = probs[1];
+            new_face_state = 0;
         }
-        if (probs[2] > best)
+        if (probs[2] > best) {
             face_color = Scalar(255,0,0);
+            new_face_state = 2;
+        }
 
-        sprintf(buff, "%.2f,%.2f,%.2f", probs[0], probs[1], probs[2]);
-        putText(frameDisp, buff, the_face.tl(), FONT_HERSHEY_DUPLEX, 0.8, face_color, 2, 8, false);
-        face_msg.x = (the_face.x + the_face.width/2) - resized_gpu.cols/2;          // Position relative to center
-        face_msg.y = (the_face.y + the_face.height/2) - resized_gpu.rows/2;         // Position relative to center
-        face_msg.size = the_face.width;
-        face_msg.prob_f = probs[0];
-        face_msg.prob_l = probs[1];
-        face_msg.prob_r = probs[2];
-        face_pub_.publish(face_msg);
+        //sprintf(buff, "%.2f,%.2f,%.2f", probs[0], probs[1], probs[2]);
+        //putText(frameDisp, buff, the_face.tl(), FONT_HERSHEY_DUPLEX, 0.8, face_color, 2, 8, false);
+
+        float new_face_x = (the_face.x + the_face.width/2.) - resized_gpu.cols/2.;      // Position relative to center
+        float new_face_y = (the_face.y + the_face.height/2.) - resized_gpu.rows/2.;     // Position relative to center
+
+        if (has_face) {             // already tracking some face
+            Mat measurement = (Mat_<float>(3,1) << new_face_x, new_face_y, the_face.width);
+            setIdentity(kf.measurementNoiseCov, the_face.width * the_face.width / 16.);
+            kf.correct(measurement);
+
+            // check with previous direction
+            if (abs(new_face_state - face_state) > 1) {         // left<-->right should not occur without passing front
+                if (new_face_state > face_state) {
+                    face_state++;
+                }
+                else {
+                    face_state--;
+                }
+            }
+            else {
+                face_state = new_face_state;
+            }
+        }
+        else {
+            kf = KalmanFilter(6,3,0);
+            setIdentity(kf.measurementMatrix);
+            setIdentity(kf.transitionMatrix);
+            setIdentity(kf.processNoiseCov, Scalar::all(100));          // SD 10 px
+            setIdentity(kf.errorCovPost, Scalar::all(the_face.width * the_face.width / 16.));
+            setIdentity(kf.errorCovPre, Scalar::all(the_face.width * the_face.width / 16.));
+            kf.statePost = (Mat_<float>(6,1) << new_face_x, new_face_y , the_face.width, 0, 0, 0);
+            kf.statePre = kf.statePost;
+            face_state = new_face_state;
+            last_time = ros::Time::now();
+            has_face = true;
+            ROS_INFO("Start tracking face");
+        }
+
+        if (count_face >= 5) {      // When face has been tracked for 5 frames
+            face_msg.x = (int) kf.statePost.at<float>(0,0);
+            face_msg.y = (int) kf.statePost.at<float>(1,0);
+            face_msg.size = (int) kf.statePost.at<float>(2,0);
+            face_msg.prob_f = probs[0];
+            face_msg.prob_l = probs[1];
+            face_msg.prob_r = probs[2];
+            face_pub_.publish(face_msg);
+
+            // draw on the image for debug
+            Scalar tracked_color = (face_state == 0 ? Scalar(64,64,255) : (face_state == 1) ? Scalar(64,255,64) : Scalar(255,64,64));
+            rectangle(frameDisp, Point(face_msg.x - face_msg.size/2. + resized_gpu.cols/2., face_msg.y - face_msg.size/2. + resized_gpu.rows/2.),
+                    Point(face_msg.x + face_msg.size/2. + resized_gpu.cols/2., face_msg.y + face_msg.size/2. + resized_gpu.rows/2.),
+                    tracked_color, 2);
+            circle(frameDisp, Point(face_msg.x + resized_gpu.cols/2., face_msg.y + resized_gpu.rows/2.), 2, tracked_color, -1);
+        }
+        else {
+            count_face++;
+        }
     }
 
     displayState(frameDisp, helpScreen, findLargestObject, filterRects, fps);
@@ -340,7 +409,7 @@ void FacesDetector_GPU::imageCallback(const sensor_msgs::Image::ConstPtr& msg) {
     }
 }
 
-int FacesDetector_GPU::groupFaces(vector<Rect> &inputFront, vector<Rect> &inputLeft, vector<Rect> &inputRight,
+void FacesDetector_GPU::groupFaces(vector<Rect> &inputFront, vector<Rect> &inputLeft, vector<Rect> &inputRight,
                                   Rect &output, float* probs, vector<Rect> &outputList, int groupThreshold, double eps)
 {
     // Adapted from groupRectangles(inputList, threshold, eps)
@@ -459,5 +528,25 @@ int FacesDetector_GPU::groupFaces(vector<Rect> &inputFront, vector<Rect> &inputL
         probs[0] = s*frontCounts[maxClass];
         probs[1] = s*leftCounts[maxClass];
         probs[2] = s*rightCounts[maxClass];
+    }
+}
+
+void FacesDetector_GPU::update() {
+    if (has_face) {         // Predict face
+        ros::Time new_time = ros::Time::now();
+        float delta_t = (new_time - last_time).toSec();
+        last_time = new_time;
+        kf.transitionMatrix.at<float>(0,3) = delta_t;
+        kf.transitionMatrix.at<float>(1,4) = delta_t;
+        kf.transitionMatrix.at<float>(2,5) = delta_t;
+        kf.predict();
+        if (kf.errorCovPost.at<float>(0,0) > 10000. || kf.errorCovPost.at<float>(1,1) > 10000. || kf.errorCovPost.at<float>(2,2) > 10000. ||
+            kf.statePost.at<float>(0,0) + kf.statePost.at<float>(2,0)/2. < -360. || kf.statePost.at<float>(0,0) + kf.statePost.at<float>(2,0)/2. > 360. ||
+            kf.statePost.at<float>(1,0) + kf.statePost.at<float>(2,0)/2. < -240. || kf.statePost.at<float>(1,0) + kf.statePost.at<float>(2,0)/2. > 240. ||
+            kf.statePost.at<float>(2,0) < 20.) {        // SD > 100, out of frame, too small face --> remove & reset face
+            has_face = false;
+            count_face = 0;
+            ROS_INFO("Face removed");
+        }
     }
 }
