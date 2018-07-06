@@ -1,0 +1,8 @@
+<launch>
+    <node pkg="gpu_opencv" type="gpu_FLR_faces_node" name="face_detect_blimp" output="screen">
+        <remap from="image" to="camera/image_rect_color"/>
+        <!--param name="cascade_name" value="$(find gpu_opencv)/cascade_classifiers/haarcascade_frontalface_default.xml"/>-->
+        <param name="cascade_front" value="$(find gpu_opencv)/cascade_classifiers/haarcascade_frontalface_default.xml"/>
+        <param name="cascade_side" value="$(find gpu_opencv)/cascade_classifiers/haarcascade_profileface.xml"/>
+    </node>
+</launch>
